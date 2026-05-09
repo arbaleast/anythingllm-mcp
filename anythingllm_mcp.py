@@ -28,6 +28,8 @@ mcp = FastMCP(
         "document handling, embedding, and system administration tools. "
         "All tools require a running AnythingLLM instance."
     ),
+    host="0.0.0.0",
+    port=8765,
 )
 
 # ──────────────────────────────────────────────
@@ -114,10 +116,10 @@ def _handle_error(e: Exception) -> str:
         return f"Error: {e}"
     if isinstance(e, httpx.TimeoutException):
         return "Error: Request timed out. AnythingLLM may be busy or unreachable."
-    if isinstance(e, httpx.RequestError):
-        return f"Error: Request failed: {e}"
     if isinstance(e, httpx.ConnectError):
         return f"Error: Cannot connect to AnythingLLM at {API_BASE_URL}. Is it running?"
+    if isinstance(e, httpx.RequestError):
+        return f"Error: Request failed: {e}"
     return f"Error: {type(e).__name__}: {e}"
 
 
@@ -131,8 +133,16 @@ def _json_response(data: Any) -> str:
 # ──────────────────────────────────────────────
 
 class ChatMode(str, Enum):
+    """Chat modes for workspace interactions.
+
+    From the official AnythingLLM API:
+    - chat: Uses LLM general knowledge w/custom embeddings, uses rolling chat history.
+    - query: Will not use LLM unless there are relevant sources from vectorDB & does not recall chat history.
+    - automatic: Will use tool-calling if the provider supports native tool calling.
+    """
     CHAT = "chat"
     QUERY = "query"
+    AUTOMATIC = "automatic"
 
 
 # ──────────────────────────────────────────────
@@ -293,22 +303,36 @@ async def delete_workspace(slug: str) -> str:
     name="anythingllm_chat",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-async def chat_with_workspace(slug: str, message: str, mode: ChatMode = ChatMode.CHAT) -> str:
+async def chat_with_workspace(
+    slug: str,
+    message: str,
+    mode: ChatMode = ChatMode.CHAT,
+    sessionId: Optional[str] = None,
+    reset: bool = False,
+) -> str:
     """Send a message to a workspace and get a response.
 
-    Mode 'chat' uses document context + conversation history.
-    Mode 'query' uses only document context (no history).
+    Mode 'chat' uses LLM general knowledge w/custom embeddings, uses rolling chat history.
+    Mode 'query' will not use LLM unless there are relevant sources from vectorDB & does not recall chat history.
+    Mode 'automatic' will use tool-calling if the provider supports native tool calling.
 
     Args:
         slug: Workspace slug
         message: Message to send
-        mode: 'chat' (context + history) or 'query' (documents only)
+        mode: 'chat' (context + history), 'query' (documents only), or 'automatic' (tool-calling)
+        sessionId: Optional session ID to partition chats by external ID
+        reset: If true, resets the chat session
     """
     try:
+        body: dict[str, Any] = {"message": message, "mode": mode.value}
+        if sessionId is not None:
+            body["sessionId"] = sessionId
+        if reset:
+            body["reset"] = reset
         result = await _api(
             f"/workspace/{slug}/chat",
             method="POST",
-            body={"message": message, "mode": mode.value},
+            body=body,
         )
         return _json_response(result)
     except Exception as e:
@@ -319,14 +343,29 @@ async def chat_with_workspace(slug: str, message: str, mode: ChatMode = ChatMode
     name="anythingllm_get_chat_history",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-async def get_chat_history(slug: str) -> str:
+async def get_chat_history(
+    slug: str,
+    apiSessionId: Optional[str] = None,
+    limit: Optional[int] = None,
+    orderBy: Optional[str] = None,
+) -> str:
     """Get the chat history for a workspace.
 
     Args:
         slug: Workspace slug
+        apiSessionId: Optional API session ID to filter by
+        limit: Optional number of chat messages to return (default: 100)
+        orderBy: Optional order of chat messages ('asc' or 'desc')
     """
     try:
-        result = await _api(f"/workspace/{slug}/chats")
+        params: dict[str, Any] = {}
+        if apiSessionId is not None:
+            params["apiSessionId"] = apiSessionId
+        if limit is not None:
+            params["limit"] = limit
+        if orderBy is not None:
+            params["orderBy"] = orderBy
+        result = await _api(f"/workspace/{slug}/chats", params=params if params else None)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -422,6 +461,24 @@ async def chat_in_thread(
             method="POST",
             body={"message": message, "mode": mode.value},
         )
+        return _json_response(result)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
+    name="anythingllm_get_thread",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+async def get_thread(slug: str, thread_slug: str) -> str:
+    """Get a specific thread by slug in a workspace.
+
+    Args:
+        slug: Workspace slug
+        thread_slug: Thread slug
+    """
+    try:
+        result = await _api(f"/workspace/{slug}/thread/{thread_slug}")
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)

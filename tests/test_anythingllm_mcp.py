@@ -187,3 +187,39 @@ def test_get_document_metadata_schema_success() -> None:
     finally:
         server.API_KEY = original_key
         server.API_BASE_URL = original_base
+
+
+def test_get_thread_success() -> None:
+    original_key, original_base = server.API_KEY, server.API_BASE_URL
+    try:
+        server.API_KEY = "test-token"
+        server.API_BASE_URL = "http://localhost:3001"
+        with respx.mock(assert_all_called=True) as mock:
+            mock.get("http://localhost:3001/api/v1/workspace/demo/thread/t-slug").respond(
+                status_code=200,
+                json={"thread": {"slug": "t-slug", "name": "test-thread"}},
+            )
+            result = asyncio.run(server.get_thread("demo", "t-slug"))
+        assert '"t-slug"' in result
+    finally:
+        server.API_KEY = original_key
+        server.API_BASE_URL = original_base
+
+
+def test_chat_with_workspace_accepts_automatic_mode() -> None:
+    original_key, original_base = server.API_KEY, server.API_BASE_URL
+    try:
+        server.API_KEY = "test-token"
+        server.API_BASE_URL = "http://localhost:3001"
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post("http://localhost:3001/api/v1/workspace/demo/chat").respond(
+                status_code=200,
+                json={"textResponse": "hello"},
+            )
+            result = asyncio.run(
+                server.chat_with_workspace("demo", "hi", mode=server.ChatMode.AUTOMATIC)
+            )
+        assert '"hello"' in result
+    finally:
+        server.API_KEY = original_key
+        server.API_BASE_URL = original_base

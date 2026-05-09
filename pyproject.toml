@@ -23,6 +23,8 @@ dependencies = [
     "mcp[cli]>=1.27.0",
     "httpx>=0.27.0",
     "pydantic>=2.13.1",
+    "fastapi>=0.136.1",
+    "uvicorn>=0.40.0",
 ]
 
 [project.optional-dependencies]
@@ -30,14 +32,21 @@ dev = [
     "pytest>=9.0.3",
     "respx>=0.23.1",
 ]
+image = [
+    "pillow>=10.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/andreperez/anythingllm-mcp"
 Repository = "https://github.com/andreperez/anythingllm-mcp"
 Issues = "https://github.com/andreperez/anythingllm-mcp/issues"
 
-[project.scripts]
-anythingllm-mcp = "anythingllm_mcp:main"
+# NOTE: The canonical AnythingLLM API usage is in anythingllm_mcp.py (/api/v1, Bearer).
+# HTTP servers (SSE, Streamable HTTP, REST gateway) are started directly:
+#   python server_sse.py        # SSE transport on port 8766
+#   python server_streamable.py # Streamable HTTP on port 8766
+#   python server_http.py       # REST gateway → AnythingLLM (set HTTP_API_KEY + ANYTHINGLLM_API_KEY)
+# Image asset: uv sync --extra image && python generate_mcp_bridge_image.py
 
 [tool.pytest.ini_options]
 addopts = "-q"

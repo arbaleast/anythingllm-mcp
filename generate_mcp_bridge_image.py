@@ -213,7 +213,7 @@ draw.text((20, 20), "00", fill=GRAY_DARK, font=font_tiny)
 draw.text((WIDTH - 40, HEIGHT - 40), "16", fill=GRAY_DARK, font=font_tiny)
 
 # Save with high quality
-output_path = 'a:/Docker/Meus artigos/anythingllm-mcp-bridge.png'
+output_path = 'anythingllm-mcp-bridge.png'
 img.save(output_path, 'PNG', optimize=True, quality=95)
 print("✓ Image created: anythingllm-mcp-bridge.png")
 print(f"  Resolution: {WIDTH}x{HEIGHT} pixels (16:9)")
