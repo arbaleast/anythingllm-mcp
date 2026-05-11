@@ -52,6 +52,12 @@ Issues = "https://github.com/andreperez/anythingllm-mcp/issues"
 addopts = "-q"
 testpaths = ["tests"]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/anythingllm_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

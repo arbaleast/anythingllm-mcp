@@ -31,23 +31,18 @@ from fastapi.responses import (
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-# ──────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────
-
-API_BASE_URL = os.environ.get("ANYTHINGLLM_BASE_URL", "http://localhost:3001").rstrip("/")
-API_KEY = os.environ.get("ANYTHINGLLM_API_KEY", "")
-SERVER_API_KEY = os.environ.get("HTTP_API_KEY", "zed-hermes-key")
-SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8766")
+from config import get_config
 
 # ──────────────────────────────────────────────
-# AnythingLLM API
+# AnythingLLM API (using config)
 # ──────────────────────────────────────────────
 
 async def allm_api(path: str, method: str = "GET", body: Optional[dict] = None) -> dict:
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        resp = await client.request(method, f"{API_BASE_URL}/api/v1{path}",
+    """Make async API request to AnythingLLM using config values."""
+    config = get_config()
+    headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=config.default_timeout) as client:
+        resp = await client.request(method, f"{config.api_base_url}/api/v1{path}",
                                      headers=headers, json=body)
     if resp.status_code >= 400:
         # Try to parse error; if not JSON, use status text
@@ -68,8 +63,11 @@ oauth_states: dict = {}    # state → {client_id, redirect_uri, scope, code_ver
 auth_codes: dict = {}      # code → {client_id, redirect_uri, access_token, created_at, scopes}
 access_tokens: dict = {}   # token → {client_id, created_at, scopes}
 
-AUTH_CODE_EXPIRY = 600      # 10 minutes
-TOKEN_EXPIRY = 3600        # 1 hour
+# OAuth expiry values loaded from config
+def _get_oauth_config() -> tuple[int, int]:
+    """Get OAuth expiry values from config."""
+    config = get_config()
+    return config.auth_code_expiry, config.token_expiry
 
 def generate_code() -> str:
     return base64.urlsafe_b64encode(uuid.uuid4().bytes).decode().rstrip("=")
@@ -228,12 +226,13 @@ async def h_upload_file(file_path: str, **kwargs):
     path = pathlib.Path(file_path)
     if not path.exists() or not path.is_file():
         return json.dumps({"success": False, "error": f"File not found: {file_path}"})
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    config = get_config()
+    headers = {"Authorization": f"Bearer {config.api_key}"}
+    async with httpx.AsyncClient(timeout=config.upload_timeout) as client:
         with open(file_path, "rb") as f:
             files = {"file": (path.name, f)}
             resp = await client.post(
-                f"{API_BASE_URL}/api/v1/document/upload",
+                f"{config.api_base_url}/api/v1/document/upload",
                 headers=headers, files=files)
     resp.raise_for_status()
     return json.dumps(resp.json())
@@ -245,12 +244,13 @@ async def h_upload_file_to_folder(file_path: str, folder_name: str, **kwargs):
     path = pathlib.Path(file_path)
     if not path.exists() or not path.is_file():
         return json.dumps({"success": False, "error": f"File not found: {file_path}"})
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    config = get_config()
+    headers = {"Authorization": f"Bearer {config.api_key}"}
+    async with httpx.AsyncClient(timeout=config.upload_timeout) as client:
         with open(file_path, "rb") as f:
             files = {"file": (path.name, f)}
             resp = await client.post(
-                f"{API_BASE_URL}/api/v1/document/upload/{folder_name}",
+                f"{config.api_base_url}/api/v1/document/upload/{folder_name}",
                 headers=headers, files=files)
     resp.raise_for_status()
     return json.dumps(resp.json())
@@ -611,11 +611,12 @@ sessions = SessionManager()
 # ──────────────────────────────────────────────
 
 def require_auth(authorization: Optional[str] = Header(None)) -> str:
+    config = get_config()
     if authorization is None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     token = authorization.replace("Bearer ", "").strip()
     # Accept both OAuth-issued tokens and the static HTTP API key
-    if token not in access_tokens and token != SERVER_API_KEY:
+    if token not in access_tokens and token != config.http_api_key:
         raise HTTPException(status_code=401, detail="Invalid access token")
     return token
 
@@ -659,15 +660,16 @@ async def root():
 @app.get("/.well-known/mcp")
 async def mcp_discovery():
     """MCP service discovery endpoint."""
+    config = get_config()
     return JSONResponse({
         "mcpServers": {
             "anythingllm": {
                 "sse": {
-                    "url": f"{SERVER_URL}/sse",
+                    "url": f"{config.server_url}/sse",
                     "auth": {
                         "type": "oauth",
-                        "authorizationUrl": f"{SERVER_URL}/oauth/authorize",
-                        "tokenUrl": f"{SERVER_URL}/oauth/token",
+                        "authorizationUrl": f"{config.server_url}/oauth/authorize",
+                        "tokenUrl": f"{config.server_url}/oauth/token",
                     }
                 }
             }
@@ -723,6 +725,9 @@ async def oauth_token(
     scope: Optional[str] = Form(None),
 ):
     """Exchange authorization code for access token (PKCE flow)."""
+    config = get_config()
+    token_expiry = config.token_expiry
+    
     if grant_type == "authorization_code":
         if not code or code not in auth_codes:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
@@ -741,7 +746,7 @@ async def oauth_token(
         return JSONResponse({
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": TOKEN_EXPIRY,
+            "expires_in": token_expiry,
             "scope": stored.get("scope", ""),
         })
 
@@ -755,7 +760,7 @@ async def oauth_token(
         return JSONResponse({
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": TOKEN_EXPIRY,
+            "expires_in": token_expiry,
             "scope": scope or "",
         })
 
@@ -766,7 +771,8 @@ async def oauth_token(
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "ok", "api_key_configured": bool(API_KEY)})
+    config = get_config()
+    return JSONResponse({"status": "ok", "api_key_configured": config.is_api_key_configured})
 
 @app.get("/sse")
 async def sse_endpoint(authorization: str = Header(None)):
@@ -883,4 +889,5 @@ async def delete_session(sessionId: str, authorization: str = Header(None)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8766, log_level="info")
+    config = get_config()
+    uvicorn.run(app, host=config.server_host, port=config.server_port, log_level="info")

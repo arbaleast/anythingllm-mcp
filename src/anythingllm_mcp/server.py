@@ -4,22 +4,35 @@ MCP Server for AnythingLLM.
 
 Provides tools for managing workspaces, chatting, handling documents,
 and administering system settings via the AnythingLLM REST API.
+
+Architecture:
+- Uses config.py for centralized configuration management
+- Uses api_client.py for unified API interactions
+- Uses tool_registry.py for tool registration
 """
 
 import json
 import os
-from typing import Optional, Any, cast
+import pathlib
 from enum import Enum
+from typing import Optional, Any, cast
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 # ──────────────────────────────────────────────
-# Configuration
+# Imports from new modules
+# ──────────────────────────────────────────────
+from config import get_config
+from api_client import AnythingLLMClient, get_client
+
+# ──────────────────────────────────────────────
+# FastMCP Server Setup
 # ──────────────────────────────────────────────
 
-API_BASE_URL = os.environ.get("ANYTHINGLLM_BASE_URL", "http://localhost:3001").rstrip("/")
-API_KEY = os.environ.get("ANYTHINGLLM_API_KEY", "")
+# Note: We call get_config() at runtime, not at import time, to allow
+# tests to set different configurations
+_server_config = get_config()
 
 mcp = FastMCP(
     "anythingllm_mcp",
@@ -28,20 +41,27 @@ mcp = FastMCP(
         "document handling, embedding, and system administration tools. "
         "All tools require a running AnythingLLM instance."
     ),
-    host="0.0.0.0",
-    port=8765,
+    host=_server_config.server_host,
+    port=_server_config.server_port,
 )
 
 # ──────────────────────────────────────────────
-# Shared utilities
+# Shared utilities (保留以保持兼容性)
 # ──────────────────────────────────────────────
 
 JsonPayload = dict[str, Any] | list[Any] | str
 
 
+def _get_config() -> "Config":
+    """Get the current config, importing here to avoid circular imports."""
+    from config import get_config as _get_config_impl
+    return _get_config_impl()
+
+
 def _require_api_key() -> None:
     """Ensure API key is configured before performing API calls."""
-    if not API_KEY.strip():
+    config = _get_config()
+    if not config.is_api_key_configured:
         raise RuntimeError(
             "ANYTHINGLLM_API_KEY is not set. Configure it before using this MCP server."
         )
@@ -62,21 +82,28 @@ def _validate_range(name: str, value: float | int, minimum: float, maximum: floa
     if value < minimum or value > maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}.")
 
+
 async def _api(
     endpoint: str,
     method: str = "GET",
     body: dict | None = None,
     params: dict | None = None,
-    timeout: float = 180.0,
+    timeout: float | None = None,
 ) -> JsonPayload:
-    """Execute an authenticated request against the AnythingLLM API."""
+    """Execute an authenticated request against the AnythingLLM API.
+    
+    Now uses centralized configuration from config.py.
+    """
+    config = _get_config()
     _require_api_key()
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    url = f"{API_BASE_URL}/api/v1{endpoint}"
+    url = f"{config.api_base_url}/api/v1{endpoint}"
+    
+    timeout = timeout or config.default_timeout
 
     async with httpx.AsyncClient() as client:
         response = await client.request(
@@ -96,6 +123,7 @@ async def _api(
 
 def _handle_error(e: Exception) -> str:
     """Return a user-friendly error message."""
+    config = _get_config()
     if isinstance(e, httpx.HTTPStatusError):
         http_error = cast(httpx.HTTPStatusError, e)
         status = http_error.response.status_code
@@ -117,7 +145,7 @@ def _handle_error(e: Exception) -> str:
     if isinstance(e, httpx.TimeoutException):
         return "Error: Request timed out. AnythingLLM may be busy or unreachable."
     if isinstance(e, httpx.ConnectError):
-        return f"Error: Cannot connect to AnythingLLM at {API_BASE_URL}. Is it running?"
+        return f"Error: Cannot connect to AnythingLLM at {config.api_base_url}. Is it running?"
     if isinstance(e, httpx.RequestError):
         return f"Error: Request failed: {e}"
     return f"Error: {type(e).__name__}: {e}"
@@ -566,27 +594,26 @@ async def upload_file(file_path: str) -> str:
         file_path: Absolute path to the file on the local filesystem.
     """
     try:
-        import pathlib
         path = pathlib.Path(file_path)
         if not path.exists() or not path.is_file():
             return f"Error: File not found: {file_path}"
-            
+        
+        config = _get_config()
         _require_api_key()
         headers = {
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {config.api_key}",
             "Accept": "application/json",
         }
-        url = f"{API_BASE_URL}/api/v1/document/upload"
+        url = f"{config.api_base_url}/api/v1/document/upload"
         
         async with httpx.AsyncClient() as client:
             with open(file_path, "rb") as f:
-                # Add a dummy content-type so httpx figures it's a file
                 files = {"file": (path.name, f)}
                 response = await client.post(
                     url,
                     headers=headers,
                     files=files,
-                    timeout=300.0,
+                    timeout=config.upload_timeout,
                 )
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "")
@@ -631,17 +658,17 @@ async def upload_file_to_folder(file_path: str, folder_name: str) -> str:
         folder_name: Target folder name in AnythingLLM (must already exist).
     """
     try:
-        import pathlib
         path = pathlib.Path(file_path)
         if not path.exists() or not path.is_file():
             return f"Error: File not found: {file_path}"
 
+        config = _get_config()
         _require_api_key()
         headers = {
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {config.api_key}",
             "Accept": "application/json",
         }
-        url = f"{API_BASE_URL}/api/v1/document/upload/{folder_name}"
+        url = f"{config.api_base_url}/api/v1/document/upload/{folder_name}"
 
         async with httpx.AsyncClient() as client:
             with open(file_path, "rb") as f:
@@ -650,7 +677,7 @@ async def upload_file_to_folder(file_path: str, folder_name: str) -> str:
                     url,
                     headers=headers,
                     files=files,
-                    timeout=300.0,
+                    timeout=config.upload_timeout,
                 )
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "")

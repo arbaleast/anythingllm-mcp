@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "anythingllm": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/anythingllm-mcp",
+        "anythingllm-mcp"
+      ],
+      "env": {
+        "ANYTHINGLLM_API_KEY": "${input:anythingllm_api_key}",
+        "ANYTHINGLLM_BASE_URL": "http://localhost:3001"
+      }
+    }
+  }
+}
