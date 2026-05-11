@@ -25,6 +25,7 @@ dependencies = [
     "pydantic>=2.13.1",
     "fastapi>=0.136.1",
     "uvicorn>=0.40.0",
+    "tenacity>=8.2.0",
 ]
 
 [project.optional-dependencies]

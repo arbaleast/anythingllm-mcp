@@ -6,32 +6,42 @@ Provides tools for managing workspaces, chatting, handling documents,
 and administering system settings via the AnythingLLM REST API.
 
 Architecture:
-- Uses config.py for centralized configuration management
-- Uses api_client.py for unified API interactions
-- Uses tool_registry.py for tool registration
+- Uses models.py for Pydantic data models (Data Layer)
+- Uses api/client.py for HTTP communication (Service Layer)
+- This module provides MCP tools as thin controllers
 """
 
 import json
-import os
+import logging
 import pathlib
-from enum import Enum
 from typing import Optional, Any, cast
 
-import httpx
 from mcp.server.fastmcp import FastMCP
 
-# ──────────────────────────────────────────────
-# Imports from new modules
-# ──────────────────────────────────────────────
 from config import get_config
-from api_client import AnythingLLMClient, get_client
+from models import ChatMode, VectorSearchMode, WorkspaceUpdate
+from api.client import (
+    AnythingLLMAPIClient,
+    get_api_client,
+    close_api_client,
+    format_api_error,
+    ValidationError,
+)
+
+# ──────────────────────────────────────────────
+# Logging configuration
+# ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("anythingllm_mcp")
+
 
 # ──────────────────────────────────────────────
 # FastMCP Server Setup
 # ──────────────────────────────────────────────
 
-# Note: We call get_config() at runtime, not at import time, to allow
-# tests to set different configurations
 _server_config = get_config()
 
 mcp = FastMCP(
@@ -45,37 +55,10 @@ mcp = FastMCP(
     port=_server_config.server_port,
 )
 
+
 # ──────────────────────────────────────────────
-# Shared utilities (保留以保持兼容性)
+# Shared utilities
 # ──────────────────────────────────────────────
-
-JsonPayload = dict[str, Any] | list[Any] | str
-
-
-def _get_config() -> "Config":
-    """Get the current config, importing here to avoid circular imports."""
-    from config import get_config as _get_config_impl
-    return _get_config_impl()
-
-
-def _require_api_key() -> None:
-    """Ensure API key is configured before performing API calls."""
-    config = _get_config()
-    if not config.is_api_key_configured:
-        raise RuntimeError(
-            "ANYTHINGLLM_API_KEY is not set. Configure it before using this MCP server."
-        )
-
-
-def _as_dict(payload: JsonPayload, endpoint: str) -> dict[str, Any]:
-    """Safely convert API payload into dict when expected."""
-    if isinstance(payload, dict):
-        return payload
-    raise TypeError(
-        f"Unexpected response type from '{endpoint}'. "
-        f"Expected object, got {type(payload).__name__}."
-    )
-
 
 def _validate_range(name: str, value: float | int, minimum: float, maximum: float) -> None:
     """Validate numeric value is within inclusive range."""
@@ -83,94 +66,14 @@ def _validate_range(name: str, value: float | int, minimum: float, maximum: floa
         raise ValueError(f"{name} must be between {minimum} and {maximum}.")
 
 
-async def _api(
-    endpoint: str,
-    method: str = "GET",
-    body: dict | None = None,
-    params: dict | None = None,
-    timeout: float | None = None,
-) -> JsonPayload:
-    """Execute an authenticated request against the AnythingLLM API.
-    
-    Now uses centralized configuration from config.py.
-    """
-    config = _get_config()
-    _require_api_key()
-    headers = {
-        "Authorization": f"Bearer {config.api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    url = f"{config.api_base_url}/api/v1{endpoint}"
-    
-    timeout = timeout or config.default_timeout
-
-    async with httpx.AsyncClient() as client:
-        response = await client.request(
-            method,
-            url,
-            headers=headers,
-            json=body,
-            params=params,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return response.json()
-        return response.text
-
-
-def _handle_error(e: Exception) -> str:
-    """Return a user-friendly error message."""
-    config = _get_config()
-    if isinstance(e, httpx.HTTPStatusError):
-        http_error = cast(httpx.HTTPStatusError, e)
-        status = http_error.response.status_code
-        try:
-            detail = http_error.response.json()
-        except Exception:
-            detail = http_error.response.text
-        messages = {
-            401: "Authentication failed. Check your ANYTHINGLLM_API_KEY.",
-            403: "Permission denied. Your API key may lack required permissions.",
-            404: "Resource not found. Check the slug or ID.",
-            429: "Rate limit exceeded. Wait before retrying.",
-            500: "Internal server error in AnythingLLM. Check LLM provider connectivity.",
-        }
-        msg = messages.get(status, f"API error (HTTP {status}).")
-        return f"Error: {msg}\nDetails: {json.dumps(detail) if isinstance(detail, dict) else detail}"
-    if isinstance(e, RuntimeError):
-        return f"Error: {e}"
-    if isinstance(e, httpx.TimeoutException):
-        return "Error: Request timed out. AnythingLLM may be busy or unreachable."
-    if isinstance(e, httpx.ConnectError):
-        return f"Error: Cannot connect to AnythingLLM at {config.api_base_url}. Is it running?"
-    if isinstance(e, httpx.RequestError):
-        return f"Error: Request failed: {e}"
-    return f"Error: {type(e).__name__}: {e}"
-
-
 def _json_response(data: Any) -> str:
     """Serialize data to pretty JSON."""
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
-# ──────────────────────────────────────────────
-# Enums
-# ──────────────────────────────────────────────
-
-class ChatMode(str, Enum):
-    """Chat modes for workspace interactions.
-
-    From the official AnythingLLM API:
-    - chat: Uses LLM general knowledge w/custom embeddings, uses rolling chat history.
-    - query: Will not use LLM unless there are relevant sources from vectorDB & does not recall chat history.
-    - automatic: Will use tool-calling if the provider supports native tool calling.
-    """
-    CHAT = "chat"
-    QUERY = "query"
-    AUTOMATIC = "automatic"
+def _handle_error(e: Exception) -> str:
+    """Return a user-friendly error message with logging."""
+    return format_api_error(e)
 
 
 # ──────────────────────────────────────────────
@@ -184,7 +87,8 @@ class ChatMode(str, Enum):
 async def check_auth() -> str:
     """Verify that the API key is valid and AnythingLLM is reachable."""
     try:
-        result = await _api("/auth")
+        client = get_api_client()
+        result = await client.check_auth()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -201,8 +105,8 @@ async def check_auth() -> str:
 async def list_workspaces() -> str:
     """List all workspaces in the AnythingLLM instance with their slugs, settings, and thread info."""
     try:
-        result = _as_dict(await _api("/workspaces"), "/workspaces")
-        workspaces = result.get("workspaces", [])
+        client = get_api_client()
+        workspaces = await client.list_workspaces()
         summary = []
         for ws in workspaces:
             summary.append({
@@ -229,7 +133,8 @@ async def get_workspace(slug: str) -> str:
         slug: Workspace slug (e.g. 'papers', 'lands')
     """
     try:
-        result = await _api(f"/workspace/{slug}")
+        client = get_api_client()
+        result = await client.get_workspace(slug)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -246,7 +151,8 @@ async def create_workspace(name: str) -> str:
         name: Name for the new workspace
     """
     try:
-        result = await _api("/workspace/new", method="POST", body={"name": name})
+        client = get_api_client()
+        result = await client.create_workspace(name=name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -288,20 +194,20 @@ async def update_workspace(
         if topN is not None:
             _validate_range("topN", topN, 1, 20)
 
-        all_params = {
-            "name": name,
-            "openAiTemp": openAiTemp,
-            "openAiHistory": openAiHistory,
-            "openAiPrompt": openAiPrompt,
-            "similarityThreshold": similarityThreshold,
-            "topN": topN,
-            "chatMode": chatMode.value if chatMode else None,
-        }
-        updates = {k: v for k, v in all_params.items() if v is not None}
-        if not updates:
-            return "Error: No updates provided."
-        result = await _api(f"/workspace/{slug}/update", method="POST", body=updates)
+        updates = WorkspaceUpdate(
+            name=name,
+            openAiTemp=openAiTemp,
+            openAiHistory=openAiHistory,
+            openAiPrompt=openAiPrompt,
+            similarityThreshold=similarityThreshold,
+            topN=topN,
+            chatMode=chatMode,
+        )
+        client = get_api_client()
+        result = await client.update_workspace(slug, updates)
         return _json_response(result)
+    except ValidationError as e:
+        return _handle_error(e)
     except Exception as e:
         return _handle_error(e)
 
@@ -317,7 +223,8 @@ async def delete_workspace(slug: str) -> str:
         slug: Workspace slug to delete
     """
     try:
-        await _api(f"/workspace/{slug}", method="DELETE")
+        client = get_api_client()
+        await client.delete_workspace(slug)
         return f"Workspace '{slug}' deleted successfully."
     except Exception as e:
         return _handle_error(e)
@@ -350,17 +257,19 @@ async def chat_with_workspace(
         mode: 'chat' (context + history), 'query' (documents only), or 'automatic' (tool-calling)
         sessionId: Optional session ID to partition chats by external ID
         reset: If true, resets the chat session
+
+    Note: Streaming responses are planned for future API support. Currently returns
+    the complete response after generation. For real-time streaming, the AnythingLLM
+    API must support Server-Sent Events (SSE) for chat responses.
     """
     try:
-        body: dict[str, Any] = {"message": message, "mode": mode.value}
-        if sessionId is not None:
-            body["sessionId"] = sessionId
-        if reset:
-            body["reset"] = reset
-        result = await _api(
-            f"/workspace/{slug}/chat",
-            method="POST",
-            body=body,
+        client = get_api_client()
+        result = await client.chat(
+            workspace_slug=slug,
+            message=message,
+            mode=mode,
+            session_id=sessionId,
+            reset=reset,
         )
         return _json_response(result)
     except Exception as e:
@@ -386,14 +295,13 @@ async def get_chat_history(
         orderBy: Optional order of chat messages ('asc' or 'desc')
     """
     try:
-        params: dict[str, Any] = {}
-        if apiSessionId is not None:
-            params["apiSessionId"] = apiSessionId
-        if limit is not None:
-            params["limit"] = limit
-        if orderBy is not None:
-            params["orderBy"] = orderBy
-        result = await _api(f"/workspace/{slug}/chats", params=params if params else None)
+        client = get_api_client()
+        result = await client.get_chat_history(
+            workspace_slug=slug,
+            session_id=apiSessionId,
+            limit=limit,
+            order_by=orderBy,
+        )
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -415,10 +323,8 @@ async def create_thread(slug: str, name: Optional[str] = None) -> str:
         name: Optional thread name
     """
     try:
-        body = {}
-        if name:
-            body["name"] = name
-        result = await _api(f"/workspace/{slug}/thread/new", method="POST", body=body)
+        client = get_api_client()
+        result = await client.create_thread(workspace_slug=slug, name=name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -436,7 +342,8 @@ async def delete_thread(slug: str, thread_slug: str) -> str:
         thread_slug: Thread slug to delete
     """
     try:
-        await _api(f"/workspace/{slug}/thread/{thread_slug}", method="DELETE")
+        client = get_api_client()
+        await client.delete_thread(workspace_slug=slug, thread_slug=thread_slug)
         return f"Thread '{thread_slug}' deleted from workspace '{slug}'."
     except Exception as e:
         return _handle_error(e)
@@ -455,11 +362,8 @@ async def update_thread(slug: str, thread_slug: str, name: str) -> str:
         name: New name for the thread.
     """
     try:
-        result = await _api(
-            f"/workspace/{slug}/thread/{thread_slug}/update",
-            method="POST",
-            body={"name": name},
-        )
+        client = get_api_client()
+        result = await client.update_thread(workspace_slug=slug, thread_slug=thread_slug, name=name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -484,10 +388,12 @@ async def chat_in_thread(
         mode: 'chat' or 'query'
     """
     try:
-        result = await _api(
-            f"/workspace/{slug}/thread/{thread_slug}/chat",
-            method="POST",
-            body={"message": message, "mode": mode.value},
+        client = get_api_client()
+        result = await client.chat_in_thread(
+            workspace_slug=slug,
+            thread_slug=thread_slug,
+            message=message,
+            mode=mode,
         )
         return _json_response(result)
     except Exception as e:
@@ -506,7 +412,8 @@ async def get_thread(slug: str, thread_slug: str) -> str:
         thread_slug: Thread slug
     """
     try:
-        result = await _api(f"/workspace/{slug}/thread/{thread_slug}")
+        client = get_api_client()
+        result = await client.get_thread(workspace_slug=slug, thread_slug=thread_slug)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -524,7 +431,8 @@ async def get_thread_chats(slug: str, thread_slug: str) -> str:
         thread_slug: Thread slug
     """
     try:
-        result = await _api(f"/workspace/{slug}/thread/{thread_slug}/chats")
+        client = get_api_client()
+        result = await client.get_thread_chats(workspace_slug=slug, thread_slug=thread_slug)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -541,7 +449,8 @@ async def get_thread_chats(slug: str, thread_slug: str) -> str:
 async def list_documents() -> str:
     """List all uploaded documents across all folders."""
     try:
-        result = await _api("/documents")
+        client = get_api_client()
+        result = await client.list_documents()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -554,7 +463,8 @@ async def list_documents() -> str:
 async def get_accepted_file_types() -> str:
     """Get the list of file types that AnythingLLM accepts for upload."""
     try:
-        result = await _api("/document/accepted-file-types")
+        client = get_api_client()
+        result = await client.get_accepted_file_types()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -573,11 +483,8 @@ async def upload_link(link: str) -> str:
     try:
         if not link.startswith(("http://", "https://")):
             return "Error: Link must start with http:// or https://"
-        result = await _api(
-            "/document/upload-link",
-            method="POST",
-            body={"link": link},
-        )
+        client = get_api_client()
+        result = await client.upload_link(link)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -597,29 +504,9 @@ async def upload_file(file_path: str) -> str:
         path = pathlib.Path(file_path)
         if not path.exists() or not path.is_file():
             return f"Error: File not found: {file_path}"
-        
-        config = _get_config()
-        _require_api_key()
-        headers = {
-            "Authorization": f"Bearer {config.api_key}",
-            "Accept": "application/json",
-        }
-        url = f"{config.api_base_url}/api/v1/document/upload"
-        
-        async with httpx.AsyncClient() as client:
-            with open(file_path, "rb") as f:
-                files = {"file": (path.name, f)}
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    files=files,
-                    timeout=config.upload_timeout,
-                )
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    return _json_response(response.json())
-                return _json_response(response.text)
+        client = get_api_client()
+        result = await client.upload_file(file_path)
+        return _json_response(result)
     except Exception as e:
         return _handle_error(e)
 
@@ -636,11 +523,8 @@ async def upload_raw_text(text_content: str, title: str) -> str:
         title: Document title
     """
     try:
-        result = await _api(
-            "/document/raw-text",
-            method="POST",
-            body={"textContent": text_content, "metadata": {"title": title}},
-        )
+        client = get_api_client()
+        result = await client.upload_raw_text(text_content=text_content, title=title)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -661,29 +545,9 @@ async def upload_file_to_folder(file_path: str, folder_name: str) -> str:
         path = pathlib.Path(file_path)
         if not path.exists() or not path.is_file():
             return f"Error: File not found: {file_path}"
-
-        config = _get_config()
-        _require_api_key()
-        headers = {
-            "Authorization": f"Bearer {config.api_key}",
-            "Accept": "application/json",
-        }
-        url = f"{config.api_base_url}/api/v1/document/upload/{folder_name}"
-
-        async with httpx.AsyncClient() as client:
-            with open(file_path, "rb") as f:
-                files = {"file": (path.name, f)}
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    files=files,
-                    timeout=config.upload_timeout,
-                )
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "")
-                if "application/json" in content_type:
-                    return _json_response(response.json())
-                return _json_response(response.text)
+        client = get_api_client()
+        result = await client.upload_file(file_path, folder_name=folder_name)
+        return _json_response(result)
     except Exception as e:
         return _handle_error(e)
 
@@ -699,7 +563,8 @@ async def list_documents_in_folder(folder_name: str) -> str:
         folder_name: Folder name to list documents from.
     """
     try:
-        result = await _api(f"/documents/folder/{folder_name}")
+        client = get_api_client()
+        result = await client.list_documents_in_folder(folder_name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -719,7 +584,8 @@ async def get_document(doc_name: str) -> str:
         doc_name: Document name/path as returned by the documents API.
     """
     try:
-        result = await _api(f"/document/{doc_name}")
+        client = get_api_client()
+        result = await client.get_document(doc_name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -732,7 +598,8 @@ async def get_document(doc_name: str) -> str:
 async def get_document_metadata_schema() -> str:
     """Get the metadata schema that AnythingLLM uses for documents."""
     try:
-        result = await _api("/document/metadata-schema")
+        client = get_api_client()
+        result = await client.get_document_metadata_schema()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -749,7 +616,8 @@ async def create_folder(name: str) -> str:
         name: Name for the new folder.
     """
     try:
-        result = await _api("/document/create-folder", method="POST", body={"name": name})
+        client = get_api_client()
+        result = await client.create_folder(name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -766,7 +634,8 @@ async def remove_folder(name: str) -> str:
         name: Folder name to delete.
     """
     try:
-        result = await _api("/document/remove-folder", method="DELETE", body={"name": name})
+        client = get_api_client()
+        result = await client.remove_folder(name)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -793,7 +662,8 @@ async def move_files(files: list[dict[str, str]]) -> str:
         for entry in files:
             if "from" not in entry or "to" not in entry:
                 return "Error: Each entry in 'files' must have 'from' and 'to' keys."
-        result = await _api("/document/move-files", method="POST", body={"files": files})
+        client = get_api_client()
+        result = await client.move_files(files)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -828,18 +698,10 @@ async def update_embeddings(
                  the file remains in AnythingLLM storage).
     """
     try:
-        body: dict[str, Any] = {}
-        if adds:
-            body["adds"] = adds
-        if deletes:
-            body["deletes"] = deletes
-        if not body:
+        if not adds and not deletes:
             return "Error: Provide at least 'adds' or 'deletes'."
-        result = await _api(
-            f"/workspace/{slug}/update-embeddings",
-            method="POST",
-            body=body,
-        )
+        client = get_api_client()
+        result = await client.update_embeddings(workspace_slug=slug, adds=adds, deletes=deletes)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -862,11 +724,8 @@ async def update_pin(slug: str, doc_path: str, pinned: bool) -> str:
         pinned: True to pin, False to unpin.
     """
     try:
-        result = await _api(
-            f"/workspace/{slug}/update-pin",
-            method="POST",
-            body={"docPath": doc_path, "pinStatus": pinned},
-        )
+        client = get_api_client()
+        result = await client.update_pin(workspace_slug=slug, doc_path=doc_path, pinned=pinned)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -880,7 +739,12 @@ async def update_pin(slug: str, doc_path: str, pinned: bool) -> str:
     name="anythingllm_search",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-async def search_workspace(slug: str, query: str, top_n: int = 4, score_threshold: Optional[float] = None) -> str:
+async def search_workspace(
+    slug: str,
+    query: str,
+    top_n: int = 4,
+    score_threshold: Optional[float] = None,
+) -> str:
     """Search for relevant document chunks within a workspace using vector similarity.
 
     Args:
@@ -891,14 +755,14 @@ async def search_workspace(slug: str, query: str, top_n: int = 4, score_threshol
     """
     try:
         _validate_range("top_n", top_n, 1, 20)
-        body: dict = {"query": query, "topN": top_n}
         if score_threshold is not None:
             _validate_range("score_threshold", score_threshold, 0.0, 1.0)
-            body["scoreThreshold"] = score_threshold
-        result = await _api(
-            f"/workspace/{slug}/vector-search",
-            method="POST",
-            body=body,
+        client = get_api_client()
+        result = await client.search_workspace(
+            workspace_slug=slug,
+            query=query,
+            top_n=top_n,
+            score_threshold=score_threshold,
         )
         return _json_response(result)
     except Exception as e:
@@ -916,16 +780,19 @@ async def search_workspace(slug: str, query: str, top_n: int = 4, score_threshol
 async def get_system_settings() -> str:
     """Get AnythingLLM system settings (LLM provider, vector DB, embeddings, etc.)."""
     try:
-        result = _as_dict(await _api("/system"), "/system")
-        settings = result.get("settings", {})
-        safe_keys = [
-            "LLMProvider", "LLMModel", "VectorDB", "EmbeddingEngine",
-            "EmbeddingModelPref", "EmbeddingModelMaxChunkLength",
-            "MultiUserMode", "DisableTelemetry", "WhisperProvider",
-            "TextToSpeechProvider", "OllamaLLMBasePath", "OllamaLLMModelPref",
-        ]
-        filtered = {k: settings.get(k) for k in safe_keys if settings.get(k) is not None}
-        return _json_response({"settings": filtered})
+        client = get_api_client()
+        result = await client.get_system_settings()
+        if isinstance(result, dict):
+            settings = result.get("settings", {})
+            safe_keys = [
+                "LLMProvider", "LLMModel", "VectorDB", "EmbeddingEngine",
+                "EmbeddingModelPref", "EmbeddingModelMaxChunkLength",
+                "MultiUserMode", "DisableTelemetry", "WhisperProvider",
+                "TextToSpeechProvider", "OllamaLLMBasePath", "OllamaLLMModelPref",
+            ]
+            filtered = {k: settings.get(k) for k in safe_keys if settings.get(k) is not None}
+            return _json_response({"settings": filtered})
+        return _json_response(result)
     except Exception as e:
         return _handle_error(e)
 
@@ -937,7 +804,8 @@ async def get_system_settings() -> str:
 async def get_vector_count() -> str:
     """Get the total number of vectors stored in the system."""
     try:
-        result = await _api("/system/vector-count")
+        client = get_api_client()
+        result = await client.get_vector_count()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -950,7 +818,8 @@ async def get_vector_count() -> str:
 async def export_chats() -> str:
     """Export all chat logs from all workspaces."""
     try:
-        result = await _api("/system/export-chats")
+        client = get_api_client()
+        result = await client.export_chats()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -973,11 +842,8 @@ async def remove_documents(names: list[str]) -> str:
     try:
         if not names:
             return "Error: 'names' list cannot be empty."
-        result = await _api(
-            "/system/remove-documents",
-            method="DELETE",
-            body={"names": names},
-        )
+        client = get_api_client()
+        result = await client.remove_documents(names)
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -994,7 +860,8 @@ async def remove_documents(names: list[str]) -> str:
 async def list_embeds() -> str:
     """List all embed configurations (public chat widgets)."""
     try:
-        result = await _api("/embed")
+        client = get_api_client()
+        result = await client.list_embeds()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)
@@ -1011,7 +878,8 @@ async def list_embeds() -> str:
 async def list_models() -> str:
     """List available models via the OpenAI-compatible endpoint."""
     try:
-        result = await _api("/openai/models")
+        client = get_api_client()
+        result = await client.list_models()
         return _json_response(result)
     except Exception as e:
         return _handle_error(e)

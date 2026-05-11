@@ -2,10 +2,34 @@
 """
 统一配置管理模块
 提供集中化的配置管理，支持环境变量和代码配置
+
+支持从 .env 文件加载配置（通过 python-dotenv）
+优先级: 环境变量 > .env 文件 > 默认值
 """
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+# Load .env file if it exists (should be called at module import time)
+try:
+    from dotenv import load_dotenv
+    # Try loading .env from common locations
+    _dotenv_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(__file__), "..", ".env"),
+        os.path.join(os.path.dirname(__file__), "..", "..", ".env"),
+        ".env",
+    ]
+    for dotenv_path in _dotenv_paths:
+        if os.path.exists(dotenv_path):
+            load_dotenv(dotenv_path)
+            break
+    else:
+        # No .env file found, but still call load_dotenv to be safe
+        load_dotenv()
+except ImportError:
+    # python-dotenv not installed, rely on environment variables only
+    pass
 
 
 @dataclass

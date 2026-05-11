@@ -1,0 +1,10 @@
+# AnythingLLM MCP Server dependencies
+# Install with: pip install -r requirements.txt
+
+mcp[cli]>=1.27.0
+httpx>=0.27.0
+pydantic>=2.13.1
+fastapi>=0.136.1
+uvicorn>=0.40.0
+python-dotenv>=1.0.0
+tenacity>=8.2.0

@@ -1,4 +1,9 @@
 {
+  "_comment": [
+    "IMPORTANT: For security, avoid hardcoding API keys in this file.",
+    "This example uses VS Code's 'input' variable type to securely prompt for the API key.",
+    "Alternatively, use environment variable injection mechanisms or a .env file with uv run."
+  ],
   "mcpServers": {
     "anythingllm": {
       "type": "stdio",
@@ -6,12 +11,12 @@
       "args": [
         "run",
         "--directory",
-        "/path/to/anythingllm-mcp",
+        "/absolute/path/to/anythingllm-mcp",
         "anythingllm-mcp"
       ],
       "env": {
         "ANYTHINGLLM_API_KEY": "${input:anythingllm_api_key}",
-        "ANYTHINGLLM_BASE_URL": "http://localhost:3001"
+        "ANYTHINGLLM_API_BASE_URL": "http://localhost:3001"
       }
     }
   }
