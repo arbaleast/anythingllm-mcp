@@ -99,7 +99,7 @@ async def h_delete_workspace(slug: str, **kwargs):
     return await allm_api(f"/workspace/{slug}", "DELETE")
 
 async def h_chat(slug: str, message: str, mode: str = "chat", **kwargs):
-    return await allm_api(f"/workspaces/{slug}/chat", "POST", {"message": message, "mode": mode})
+    return await allm_api(f"/workspace/{slug}/chat", "POST", {"message": message, "mode": mode})
 
 async def h_get_chat_history(slug: str, **kwargs):
     return await allm_api(f"/workspaces/{slug}/chats")
